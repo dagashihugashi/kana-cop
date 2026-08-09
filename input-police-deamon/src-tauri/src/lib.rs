@@ -1,5 +1,5 @@
-use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 use tauri::{
@@ -8,15 +8,26 @@ use tauri::{
 };
 
 // Windows API のインポート
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SendMessageW, WM_IME_CONTROL};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_OEM_4};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, SendMessageW,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT,
+    MSG, WH_KEYBOARD_LL, WM_IME_CONTROL, WM_KEYDOWN, WM_SYSKEYDOWN,
+};
 
 // 初期状態はオン（true）にしておく
 static IS_ACTIVE: AtomicBool = AtomicBool::new(true);
+static HOOK_HANDLE: OnceLock<HHOOK> = OnceLock::new();
 
 const IMC_GETCONVERSIONMODE: usize = 1;
 const IMC_SETCONVERSIONMODE: usize = 2;
+
+// IME変換モードのビット定義（imm.h の IME_CMODE_*）
+const IME_CMODE_NATIVE: u32 = 0x1; // 日本語モード(ひらがな/カタカナ)か
+const IME_CMODE_KATAKANA: u32 = 0x2; // カタカナか（NATIVEと併用して判定）
+const IME_CMODE_FULLSHAPE: u32 = 0x8; // 全角か
 
 // --- 1. Windows APIによる「入力警察」のコア機能 ---
 
@@ -25,7 +36,7 @@ unsafe fn get_ime_wnd() -> HWND {
     ImmGetDefaultIMEWnd(hwnd)
 }
 
-fn enforce_half_width() {
+fn patrol_ime_mode() {
     unsafe {
         let hime = get_ime_wnd();
         if hime.0 == 0 {
@@ -43,12 +54,21 @@ fn enforce_half_width() {
         let current_mode = status.0 as u32;
 
         // ビット演算で現在の状態を判定
-        let is_native = (current_mode & 1) != 0; // 日本語モード(ひらがな等)か
-        let is_fullshape = (current_mode & 8) != 0; // 全角か
+        let is_native = (current_mode & IME_CMODE_NATIVE) != 0;
+        let is_katakana = (current_mode & IME_CMODE_KATAKANA) != 0;
+        let is_fullshape = (current_mode & IME_CMODE_FULLSHAPE) != 0;
 
-        // 「日本語入力ではなく、かつ全角になっている（＝全角アルファベット）」場合のみ全角フラグを折る
-        if !is_native && is_fullshape {
-            let new_mode = current_mode & !8;
+        let new_mode = if !is_native && is_fullshape {
+            // 「日本語入力ではなく、かつ全角（＝全角アルファベット）」→ 半角英数へ
+            Some(current_mode & !IME_CMODE_FULLSHAPE)
+        } else if is_native && is_katakana {
+            // 「日本語入力で、かつカタカナ（全角・半角とも）」→ ひらがなへ強制
+            Some((current_mode & !IME_CMODE_KATAKANA) | IME_CMODE_FULLSHAPE)
+        } else {
+            None
+        };
+
+        if let Some(new_mode) = new_mode {
             SendMessageW(
                 hime,
                 WM_IME_CONTROL,
@@ -69,33 +89,66 @@ fn force_ime_off() {
     }
 }
 
-// --- 2. 警察の任務（バックグラウンド監視＆無線待機） ---
+// --- 2. 警察の任務（バックグラウンド監視＆検問） ---
+
+unsafe extern "system" fn low_level_keyboard_proc(
+    n_code: i32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    if n_code == HC_ACTION as i32 {
+        let msg = w_param.0 as u32;
+        if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && IS_ACTIVE.load(Ordering::Relaxed) {
+            let kb = *(l_param.0 as *const KBDLLHOOKSTRUCT);
+            let vk_code = kb.vkCode;
+
+            let is_esc = vk_code == VK_ESCAPE.0 as u32;
+            let is_ctrl_bracket = vk_code == VK_OEM_4.0 as u32
+                && (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
+
+            if is_esc || is_ctrl_bracket {
+                force_ime_off();
+            }
+        }
+    }
+    // キーは奪わない: 必ずチェーンを継続する
+    CallNextHookEx(None, n_code, w_param, l_param)
+}
 
 fn start_police_tasks() {
-    // 任務A: パトロール（全角アルファベット撲滅）
+    // 任務A: パトロール（全角アルファベット撲滅 & カタカナ入力の取り締まり）
     thread::spawn(|| {
         loop {
             if IS_ACTIVE.load(Ordering::Relaxed) {
-                enforce_half_width();
+                patrol_ime_mode();
             }
             thread::sleep(Duration::from_millis(30));
         }
     });
 
-    // 任務B: 無線待機（Vimからの通報を受け取る）
-    thread::spawn(|| {
-        let socket = UdpSocket::bind("127.0.0.1:51235").expect("UDPポートの確保に失敗しました！");
-        let mut buf = [0; 10];
-        loop {
-            if let Ok((size, _)) = socket.recv_from(&mut buf) {
-                if IS_ACTIVE.load(Ordering::Relaxed) {
-                    let msg = String::from_utf8_lossy(&buf[..size]);
-                    if msg.trim() == "ESC" {
-                        force_ime_off();
-                    }
-                }
+    // 任務B: 検問（ESC / Ctrl+[ のグローバル低レベルフック監視）
+    thread::spawn(|| unsafe {
+        let hook = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), None, 0) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("キーボードフックの設置に失敗しました: {e:?}");
+                return;
             }
+        };
+        let _ = HOOK_HANDLE.set(hook);
+
+        // メッセージポンプ（WH_KEYBOARD_LLに必須）
+        let mut msg = MSG::default();
+        loop {
+            let ret = GetMessageW(&mut msg, HWND(0), 0, 0).0;
+            if ret <= 0 {
+                break;
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
+
+        let _ = UnhookWindowsHookEx(hook);
     });
 }
 
