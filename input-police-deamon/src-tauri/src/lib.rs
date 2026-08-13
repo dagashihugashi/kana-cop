@@ -9,12 +9,15 @@ use tauri::{
 
 // Windows API のインポート
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_OEM_4};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, GetFocus, VK_CONTROL, VK_ESCAPE, VK_OEM_4,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, SendMessageW,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT,
-    MSG, WH_KEYBOARD_LL, WM_IME_CONTROL, WM_KEYDOWN, WM_SYSKEYDOWN,
+    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
+    SendMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, HHOOK,
+    KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_IME_CONTROL, WM_KEYDOWN, WM_SYSKEYDOWN,
 };
 
 // 初期状態はオン（true）にしておく
@@ -32,8 +35,25 @@ const IME_CMODE_FULLSHAPE: u32 = 0x8; // 全角か
 // --- 1. Windows APIによる「入力警察」のコア機能 ---
 
 unsafe fn get_ime_wnd() -> HWND {
-    let hwnd = GetForegroundWindow();
-    ImmGetDefaultIMEWnd(hwnd)
+    let fg = GetForegroundWindow();
+    if fg.0 == 0 {
+        return HWND(0);
+    }
+
+    // Tauri(WebView2)のように、トップレベルの外枠ウィンドウと実際にキー入力を
+    // 受けている内側のウィンドウが別物になっているケースがある(診断ログで確認済み)。
+    // AttachThreadInputで対象スレッドの入力状態に一時的に相乗りし、
+    // 実際にフォーカスを持つウィンドウ(GetFocus)を取得してそちらを優先する
+    let fg_thread = GetWindowThreadProcessId(fg, None);
+    let cur_thread = GetCurrentThreadId();
+    let attached = AttachThreadInput(cur_thread, fg_thread, true).as_bool();
+    let focused = GetFocus();
+    if attached {
+        let _ = AttachThreadInput(cur_thread, fg_thread, false);
+    }
+
+    let target = if focused.0 != 0 { focused } else { fg };
+    ImmGetDefaultIMEWnd(target)
 }
 
 fn patrol_ime_mode() {
