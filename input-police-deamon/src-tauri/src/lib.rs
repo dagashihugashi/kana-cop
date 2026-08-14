@@ -34,16 +34,19 @@ const IME_CMODE_FULLSHAPE: u32 = 0x8; // 全角か
 
 // --- 1. Windows APIによる「入力警察」のコア機能 ---
 
-unsafe fn get_ime_wnd() -> HWND {
-    let fg = GetForegroundWindow();
+// 指定したフォアグラウンドウィンドウに対して、実際にIMEを制御すべきウィンドウを解決する。
+// Tauri(WebView2)のように、トップレベルの外枠ウィンドウと実際にキー入力を
+// 受けている内側のウィンドウが別物になっているケースがある(診断ログで確認済み)。
+// AttachThreadInputで対象スレッドの入力状態に一時的に相乗りし、
+// 実際にフォーカスを持つウィンドウ(GetFocus)を取得してそちらを優先する。
+//
+// AttachThreadInputはMicrosoft公式にも多用を推奨されていない、入力キューに影響する重い呼び出しなので、
+// フォアグラウンドウィンドウが変わった時だけ呼ぶ(呼び出し元でキャッシュする)前提の関数にしてある
+unsafe fn resolve_ime_wnd(fg: HWND) -> HWND {
     if fg.0 == 0 {
         return HWND(0);
     }
 
-    // Tauri(WebView2)のように、トップレベルの外枠ウィンドウと実際にキー入力を
-    // 受けている内側のウィンドウが別物になっているケースがある(診断ログで確認済み)。
-    // AttachThreadInputで対象スレッドの入力状態に一時的に相乗りし、
-    // 実際にフォーカスを持つウィンドウ(GetFocus)を取得してそちらを優先する
     let fg_thread = GetWindowThreadProcessId(fg, None);
     let cur_thread = GetCurrentThreadId();
     let attached = AttachThreadInput(cur_thread, fg_thread, true).as_bool();
@@ -56,9 +59,14 @@ unsafe fn get_ime_wnd() -> HWND {
     ImmGetDefaultIMEWnd(target)
 }
 
-fn patrol_ime_mode() {
+// ESC/Ctrl+[ 等、呼び出し頻度が低い場所向けに毎回フルに解決するバージョン
+unsafe fn get_ime_wnd() -> HWND {
+    resolve_ime_wnd(GetForegroundWindow())
+}
+
+// hime: resolve_ime_wnd()で解決済みのIMEウィンドウ（呼び出し元でキャッシュしたものを渡す）
+fn patrol_ime_mode(hime: HWND) {
     unsafe {
-        let hime = get_ime_wnd();
         if hime.0 == 0 {
             return;
         }
@@ -67,7 +75,7 @@ fn patrol_ime_mode() {
         let status = SendMessageW(
             hime,
             WM_IME_CONTROL,
-            WPARAM(IMC_GETCONVERSIONMODE as usize),
+            WPARAM(IMC_GETCONVERSIONMODE),
             LPARAM(0),
         );
 
@@ -92,7 +100,7 @@ fn patrol_ime_mode() {
             SendMessageW(
                 hime,
                 WM_IME_CONTROL,
-                WPARAM(IMC_SETCONVERSIONMODE as usize),
+                WPARAM(IMC_SETCONVERSIONMODE),
                 LPARAM(new_mode as isize),
             );
         }
@@ -104,7 +112,7 @@ fn force_ime_off() {
         let hime = get_ime_wnd();
         if hime.0 != 0 {
             // 定数 6 (IMC_SETOPENSTATUS) に対して 0 (OFF) を送信し、確実に半角英数(A)にする
-            SendMessageW(hime, WM_IME_CONTROL, WPARAM(6 as usize), LPARAM(0 as isize));
+            SendMessageW(hime, WM_IME_CONTROL, WPARAM(6_usize), LPARAM(0_isize));
         }
     }
 }
@@ -138,9 +146,21 @@ unsafe extern "system" fn low_level_keyboard_proc(
 fn start_police_tasks() {
     // 任務A: パトロール（全角アルファベット撲滅 & カタカナ入力の取り締まり）
     thread::spawn(|| {
+        // フォアグラウンドウィンドウが変わった時だけAttachThreadInputで解決し直す。
+        // GetForegroundWindow自体は軽いので毎ティック呼び、同じウィンドウが続く間は
+        // 前回解決したIMEウィンドウをキャッシュとして使い回す
+        let mut cached_fg = HWND(0);
+        let mut cached_ime = HWND(0);
         loop {
             if IS_ACTIVE.load(Ordering::Relaxed) {
-                patrol_ime_mode();
+                unsafe {
+                    let fg = GetForegroundWindow();
+                    if fg != cached_fg {
+                        cached_fg = fg;
+                        cached_ime = resolve_ime_wnd(fg);
+                    }
+                }
+                patrol_ime_mode(cached_ime);
             }
             thread::sleep(Duration::from_millis(30));
         }
