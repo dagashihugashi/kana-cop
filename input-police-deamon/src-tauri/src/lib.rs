@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
-use std::thread;
+use std::thread::{self, Thread};
 use std::time::Duration;
 use tauri::{
     menu::{Menu, MenuItem},
@@ -9,115 +9,135 @@ use tauri::{
 
 // Windows API のインポート
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetFocus, VK_CONTROL, VK_ESCAPE, VK_OEM_4,
+    GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_OEM_4,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
-    SendMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, HHOOK,
-    KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_IME_CONTROL, WM_KEYDOWN, WM_SYSKEYDOWN,
+    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetGUIThreadInfo, GetMessageW,
+    GetWindowThreadProcessId, SendMessageTimeoutW, SetWindowsHookExW, TranslateMessage,
+    UnhookWindowsHookEx, GUITHREADINFO, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG, SMTO_ABORTIFHUNG,
+    WH_KEYBOARD_LL, WM_IME_CONTROL, WM_KEYDOWN, WM_SYSKEYDOWN,
 };
 
 // 初期状態はオン（true）にしておく
 static IS_ACTIVE: AtomicBool = AtomicBool::new(true);
 static HOOK_HANDLE: OnceLock<HHOOK> = OnceLock::new();
 
+// フックからIMEオフ担当スレッドへの依頼。フック内では重い処理をせず、これを立てて起こすだけにする
+static IME_OFF_REQUESTED: AtomicBool = AtomicBool::new(false);
+static IME_OFF_WORKER: OnceLock<Thread> = OnceLock::new();
+
 const IMC_GETCONVERSIONMODE: usize = 1;
 const IMC_SETCONVERSIONMODE: usize = 2;
+const IMC_SETOPENSTATUS: usize = 6;
 
 // IME変換モードのビット定義（imm.h の IME_CMODE_*）
 const IME_CMODE_NATIVE: u32 = 0x1; // 日本語モード(ひらがな/カタカナ)か
 const IME_CMODE_KATAKANA: u32 = 0x2; // カタカナか（NATIVEと併用して判定）
 const IME_CMODE_FULLSHAPE: u32 = 0x8; // 全角か
 
+// 相手ウィンドウがこれ以上応答しなければ、そのティックは諦めて次に回す
+const IME_MESSAGE_TIMEOUT_MS: u32 = 100;
+const PATROL_INTERVAL: Duration = Duration::from_millis(30);
+
 // --- 1. Windows APIによる「入力警察」のコア機能 ---
 
-// 指定したフォアグラウンドウィンドウに対して、実際にIMEを制御すべきウィンドウを解決する。
-// Tauri(WebView2)のように、トップレベルの外枠ウィンドウと実際にキー入力を
-// 受けている内側のウィンドウが別物になっているケースがある(診断ログで確認済み)。
-// AttachThreadInputで対象スレッドの入力状態に一時的に相乗りし、
-// 実際にフォーカスを持つウィンドウ(GetFocus)を取得してそちらを優先する。
+// 現在IMEを制御すべきウィンドウを解決する。前面ウィンドウが無い、または自プロセスのもの
+// (トレイメニュー表示中など)なら何もしないようNoneを返す。
 //
-// AttachThreadInputはMicrosoft公式にも多用を推奨されていない、入力キューに影響する重い呼び出しなので、
-// フォアグラウンドウィンドウが変わった時だけ呼ぶ(呼び出し元でキャッシュする)前提の関数にしてある
-unsafe fn resolve_ime_wnd(fg: HWND) -> HWND {
+// Tauri(WebView2)やTeamsのように、トップレベルの外枠ウィンドウと実際にキー入力を
+// 受けている内側のウィンドウが別物になっているケースがあるため、GetGUIThreadInfoで
+// 前面スレッドのフォーカスウィンドウを取得してそちらを優先する。
+// 以前使っていたAttachThreadInputと違い相手の入力キューに相乗りしないので、相手が応答なしでも
+// 巻き込まれない。呼び出しも軽いのでキャッシュせず毎回解決し、同一ウィンドウ内のフォーカス移動にも追従する
+unsafe fn resolve_ime_wnd() -> Option<HWND> {
+    let fg = GetForegroundWindow();
     if fg.0 == 0 {
-        return HWND(0);
+        return None;
     }
 
-    let fg_thread = GetWindowThreadProcessId(fg, None);
-    let cur_thread = GetCurrentThreadId();
-    let attached = AttachThreadInput(cur_thread, fg_thread, true).as_bool();
-    let focused = GetFocus();
-    if attached {
-        let _ = AttachThreadInput(cur_thread, fg_thread, false);
+    let mut pid = 0u32;
+    let fg_thread = GetWindowThreadProcessId(fg, Some(&mut pid as *mut u32));
+    if pid == std::process::id() {
+        return None;
     }
 
-    let target = if focused.0 != 0 { focused } else { fg };
-    ImmGetDefaultIMEWnd(target)
+    let mut info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    let has_focus = GetGUIThreadInfo(fg_thread, &mut info).is_ok() && info.hwndFocus.0 != 0;
+    let target = if has_focus { info.hwndFocus } else { fg };
+
+    let hime = ImmGetDefaultIMEWnd(target);
+    (hime.0 != 0).then_some(hime)
 }
 
-// ESC/Ctrl+[ 等、呼び出し頻度が低い場所向けに毎回フルに解決するバージョン
-unsafe fn get_ime_wnd() -> HWND {
-    resolve_ime_wnd(GetForegroundWindow())
+// WM_IME_CONTROLを送る。応答なしの相手(SMTO_ABORTIFHUNG)や処理が遅い相手は待たずに諦め、Noneを返す
+unsafe fn send_ime_control(hime: HWND, command: usize, value: isize) -> Option<usize> {
+    let mut result = 0usize;
+    let sent = SendMessageTimeoutW(
+        hime,
+        WM_IME_CONTROL,
+        WPARAM(command),
+        LPARAM(value),
+        SMTO_ABORTIFHUNG,
+        IME_MESSAGE_TIMEOUT_MS,
+        Some(&mut result as *mut usize),
+    );
+    (sent.0 != 0).then_some(result)
 }
 
-// hime: resolve_ime_wnd()で解決済みのIMEウィンドウ（呼び出し元でキャッシュしたものを渡す）
-fn patrol_ime_mode(hime: HWND) {
+// 現在の変換モードから矯正後のモードを決める。矯正不要ならNone
+fn corrected_mode(current_mode: u32) -> Option<u32> {
+    let is_native = (current_mode & IME_CMODE_NATIVE) != 0;
+    let is_katakana = (current_mode & IME_CMODE_KATAKANA) != 0;
+    let is_fullshape = (current_mode & IME_CMODE_FULLSHAPE) != 0;
+
+    if !is_native && is_fullshape {
+        // 「日本語入力ではなく、かつ全角（＝全角アルファベット）」→ 半角英数へ
+        Some(current_mode & !IME_CMODE_FULLSHAPE)
+    } else if is_native && is_katakana {
+        // 「日本語入力で、かつカタカナ（全角・半角とも）」→ ひらがなへ強制
+        Some((current_mode & !IME_CMODE_KATAKANA) | IME_CMODE_FULLSHAPE)
+    } else {
+        None
+    }
+}
+
+fn patrol_ime_mode() {
     unsafe {
-        if hime.0 == 0 {
+        let Some(hime) = resolve_ime_wnd() else {
             return;
-        }
-
-        // 現在のIMEステータスを取得
-        let status = SendMessageW(
-            hime,
-            WM_IME_CONTROL,
-            WPARAM(IMC_GETCONVERSIONMODE),
-            LPARAM(0),
-        );
-
-        let current_mode = status.0 as u32;
-
-        // ビット演算で現在の状態を判定
-        let is_native = (current_mode & IME_CMODE_NATIVE) != 0;
-        let is_katakana = (current_mode & IME_CMODE_KATAKANA) != 0;
-        let is_fullshape = (current_mode & IME_CMODE_FULLSHAPE) != 0;
-
-        let new_mode = if !is_native && is_fullshape {
-            // 「日本語入力ではなく、かつ全角（＝全角アルファベット）」→ 半角英数へ
-            Some(current_mode & !IME_CMODE_FULLSHAPE)
-        } else if is_native && is_katakana {
-            // 「日本語入力で、かつカタカナ（全角・半角とも）」→ ひらがなへ強制
-            Some((current_mode & !IME_CMODE_KATAKANA) | IME_CMODE_FULLSHAPE)
-        } else {
-            None
         };
-
-        if let Some(new_mode) = new_mode {
-            SendMessageW(
-                hime,
-                WM_IME_CONTROL,
-                WPARAM(IMC_SETCONVERSIONMODE),
-                LPARAM(new_mode as isize),
-            );
+        let Some(current_mode) = send_ime_control(hime, IMC_GETCONVERSIONMODE, 0) else {
+            return;
+        };
+        if let Some(new_mode) = corrected_mode(current_mode as u32) {
+            let _ = send_ime_control(hime, IMC_SETCONVERSIONMODE, new_mode as isize);
         }
     }
 }
 
 fn force_ime_off() {
     unsafe {
-        let hime = get_ime_wnd();
-        if hime.0 != 0 {
-            // 定数 6 (IMC_SETOPENSTATUS) に対して 0 (OFF) を送信し、確実に半角英数(A)にする
-            SendMessageW(hime, WM_IME_CONTROL, WPARAM(6_usize), LPARAM(0_isize));
+        if let Some(hime) = resolve_ime_wnd() {
+            // IMC_SETOPENSTATUS に 0 (OFF) を送信し、確実に半角英数(A)にする
+            let _ = send_ime_control(hime, IMC_SETOPENSTATUS, 0);
         }
     }
 }
 
 // --- 2. 警察の任務（バックグラウンド監視＆検問） ---
+
+// フックから呼ぶ。IMEオフ担当スレッドを起こすだけで、すぐ戻る
+fn request_ime_off() {
+    IME_OFF_REQUESTED.store(true, Ordering::Release);
+    if let Some(worker) = IME_OFF_WORKER.get() {
+        worker.unpark();
+    }
+}
 
 unsafe extern "system" fn low_level_keyboard_proc(
     n_code: i32,
@@ -135,7 +155,9 @@ unsafe extern "system" fn low_level_keyboard_proc(
                 && (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
 
             if is_esc || is_ctrl_bracket {
-                force_ime_off();
+                // フック内で相手ウィンドウに問い合わせると、相手が応答なしの時にフックごと止まる。
+                // 実処理は別スレッドに任せ、ここでは依頼だけしてすぐチェーンに戻す
+                request_ime_off();
             }
         }
     }
@@ -145,28 +167,23 @@ unsafe extern "system" fn low_level_keyboard_proc(
 
 fn start_police_tasks() {
     // 任務A: パトロール（全角アルファベット撲滅 & カタカナ入力の取り締まり）
-    thread::spawn(|| {
-        // フォアグラウンドウィンドウが変わった時だけAttachThreadInputで解決し直す。
-        // GetForegroundWindow自体は軽いので毎ティック呼び、同じウィンドウが続く間は
-        // 前回解決したIMEウィンドウをキャッシュとして使い回す
-        let mut cached_fg = HWND(0);
-        let mut cached_ime = HWND(0);
-        loop {
-            if IS_ACTIVE.load(Ordering::Relaxed) {
-                unsafe {
-                    let fg = GetForegroundWindow();
-                    if fg != cached_fg {
-                        cached_fg = fg;
-                        cached_ime = resolve_ime_wnd(fg);
-                    }
-                }
-                patrol_ime_mode(cached_ime);
-            }
-            thread::sleep(Duration::from_millis(30));
+    thread::spawn(|| loop {
+        if IS_ACTIVE.load(Ordering::Relaxed) {
+            patrol_ime_mode();
         }
+        thread::sleep(PATROL_INTERVAL);
     });
 
-    // 任務B: 検問（ESC / Ctrl+[ のグローバル低レベルフック監視）
+    // 任務B: 出動（フックからの依頼を受けてIMEをオフにする）。フックより先に起動しておく
+    let worker = thread::spawn(|| loop {
+        thread::park();
+        if IME_OFF_REQUESTED.swap(false, Ordering::AcqRel) {
+            force_ime_off();
+        }
+    });
+    let _ = IME_OFF_WORKER.set(worker.thread().clone());
+
+    // 任務C: 検問（ESC / Ctrl+[ のグローバル低レベルフック監視）
     thread::spawn(|| unsafe {
         let hook = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), None, 0) {
             Ok(h) => h,
@@ -204,7 +221,7 @@ pub fn run() {
             // メニューアイテムを作成
             let toggle_i = MenuItem::with_id(app, "toggle", "Pause", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Exit", true, None::<&str>)?;
-            
+
             // メニューにセット
             let menu = Menu::with_items(app, &[&toggle_i, &quit_i])?;
 
@@ -219,7 +236,7 @@ pub fn run() {
                         // 状態を反転
                         let current = IS_ACTIVE.load(Ordering::Relaxed);
                         IS_ACTIVE.store(!current, Ordering::Relaxed);
-                        
+
                         // v2の書き方でメニューのテキストを動的に変更
                         if current {
                             let _ = toggle_i_clone.set_text("Restart");
@@ -239,4 +256,56 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const IME_CMODE_ROMAN: u32 = 0x10;
+
+    #[test]
+    fn fullwidth_alphanumeric_is_corrected_to_halfwidth() {
+        assert_eq!(corrected_mode(IME_CMODE_FULLSHAPE), Some(0));
+    }
+
+    #[test]
+    fn fullwidth_katakana_is_corrected_to_hiragana() {
+        let katakana = IME_CMODE_NATIVE | IME_CMODE_KATAKANA | IME_CMODE_FULLSHAPE;
+        assert_eq!(
+            corrected_mode(katakana),
+            Some(IME_CMODE_NATIVE | IME_CMODE_FULLSHAPE)
+        );
+    }
+
+    #[test]
+    fn halfwidth_katakana_is_corrected_to_fullwidth_hiragana() {
+        let halfwidth_katakana = IME_CMODE_NATIVE | IME_CMODE_KATAKANA;
+        assert_eq!(
+            corrected_mode(halfwidth_katakana),
+            Some(IME_CMODE_NATIVE | IME_CMODE_FULLSHAPE)
+        );
+    }
+
+    #[test]
+    fn hiragana_is_left_alone() {
+        assert_eq!(corrected_mode(IME_CMODE_NATIVE | IME_CMODE_FULLSHAPE), None);
+    }
+
+    #[test]
+    fn halfwidth_alphanumeric_is_left_alone() {
+        assert_eq!(corrected_mode(0), None);
+    }
+
+    #[test]
+    fn unrelated_mode_bits_are_preserved() {
+        assert_eq!(
+            corrected_mode(IME_CMODE_ROMAN | IME_CMODE_FULLSHAPE),
+            Some(IME_CMODE_ROMAN)
+        );
+        assert_eq!(
+            corrected_mode(IME_CMODE_ROMAN | IME_CMODE_NATIVE | IME_CMODE_KATAKANA),
+            Some(IME_CMODE_ROMAN | IME_CMODE_NATIVE | IME_CMODE_FULLSHAPE)
+        );
+    }
 }
