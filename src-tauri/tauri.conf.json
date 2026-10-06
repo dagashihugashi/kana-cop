@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "input-police-deamon",
+  "productName": "Kana Cop",
   "version": "0.1.0",
-  "identifier": "com.rinno.input-police-deamon",
+  "identifier": "com.rinno.kana-cop",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "input-police-deamon",
+        "title": "Kana Cop",
         "width": 800,
         "height": 600,
         "visible": false
